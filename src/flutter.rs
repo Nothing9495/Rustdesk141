@@ -1569,7 +1569,7 @@ pub mod connection_manager {
     #[inline]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn start_listen_ipc_thread() {
-        start_listen_ipc(true);
+        start_listen_ipc(false);
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
