@@ -2,6 +2,8 @@
 use super::rdp_input::client::{RdpInputKeyboard, RdpInputMouse};
 use super::*;
 use crate::input::*;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use crate::whiteboard;
 #[cfg(target_os = "macos")]
 use dispatch::Queue;
 use enigo::{Enigo, Key, KeyboardControllable, MouseButton, MouseControllable};
@@ -18,7 +20,10 @@ use scrap::wayland::pipewire::RDP_SESSION_INFO;
 use std::{
     convert::TryFrom,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{self, Duration, Instant},
 };
@@ -202,6 +207,7 @@ impl LockModesHandler {
         }
 
         let mut num_lock_changed = false;
+        #[allow(unused)]
         let mut event_num_enabled = false;
         if is_numpad_key {
             let local_num_enabled = en.get_key_state(enigo::Key::NumLock);
@@ -698,18 +704,25 @@ fn get_modifier_state(key: Key, en: &mut Enigo) -> bool {
 }
 
 #[allow(unreachable_code)]
-pub fn handle_mouse(evt: &MouseEvent, conn: i32) {
+pub fn handle_mouse(
+    evt: &MouseEvent,
+    conn: i32,
+    username: String,
+    argb: u32,
+    simulate: bool,
+    show_cursor: bool,
+) {
     #[cfg(target_os = "macos")]
     {
         // having GUI (--server has tray, it is GUI too), run main GUI thread, otherwise crash
         let evt = evt.clone();
-        QUEUE.exec_async(move || handle_mouse_(&evt, conn));
+        QUEUE.exec_async(move || handle_mouse_(&evt, conn, username, argb, simulate, show_cursor));
         return;
     }
     #[cfg(windows)]
-    crate::portable_service::client::handle_mouse(evt, conn);
+    crate::portable_service::client::handle_mouse(evt, conn, username, argb, simulate, show_cursor);
     #[cfg(not(windows))]
-    handle_mouse_(evt, conn);
+    handle_mouse_(evt, conn, username, argb, simulate, show_cursor);
 }
 
 // to-do: merge handle_mouse and handle_pointer
@@ -979,7 +992,24 @@ pub fn handle_pointer_(evt: &PointerDeviceEvent, conn: i32) {
     }
 }
 
-pub fn handle_mouse_(evt: &MouseEvent, conn: i32) {
+pub fn handle_mouse_(
+    evt: &MouseEvent,
+    conn: i32,
+    _username: String,
+    _argb: u32,
+    simulate: bool,
+    _show_cursor: bool,
+) {
+    if simulate {
+        handle_mouse_simulation_(evt, conn);
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    if _show_cursor {
+        handle_mouse_show_cursor_(evt, conn, _username, _argb);
+    }
+}
+
+pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
     if !active_mouse_(conn) {
         return;
     }
@@ -1119,6 +1149,41 @@ pub fn handle_mouse_(evt: &MouseEvent, conn: i32) {
     #[cfg(not(target_os = "macos"))]
     for key in to_release {
         en.key_up(key.clone());
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn handle_mouse_show_cursor_(evt: &MouseEvent, conn: i32, username: String, argb: u32) {
+    let buttons = evt.mask >> 3;
+    let evt_type = evt.mask & 0x7;
+    match evt_type {
+        MOUSE_TYPE_MOVE => {
+            whiteboard::update_whiteboard(
+                whiteboard::get_key_cursor(conn),
+                whiteboard::CustomEvent::Cursor(whiteboard::Cursor {
+                    x: evt.x as _,
+                    y: evt.y as _,
+                    argb,
+                    btns: 0,
+                    text: username,
+                }),
+            );
+        }
+        MOUSE_TYPE_UP => {
+            if buttons == MOUSE_BUTTON_LEFT {
+                whiteboard::update_whiteboard(
+                    whiteboard::get_key_cursor(conn),
+                    whiteboard::CustomEvent::Cursor(whiteboard::Cursor {
+                        x: evt.x as _,
+                        y: evt.y as _,
+                        argb,
+                        btns: buttons,
+                        text: username,
+                    }),
+                );
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1770,6 +1835,51 @@ pub fn wayland_use_uinput() -> bool {
 #[cfg(target_os = "linux")]
 pub fn wayland_use_rdp_input() -> bool {
     !crate::platform::is_x11() && !crate::is_server()
+}
+
+#[cfg(target_os = "linux")]
+pub struct TemporaryMouseMoveHandle {
+    thread_handle: Option<std::thread::JoinHandle<()>>,
+    tx: Option<mpsc::Sender<(i32, i32)>>,
+}
+
+#[cfg(target_os = "linux")]
+impl TemporaryMouseMoveHandle {
+    pub fn new() -> Self {
+        let (tx, rx) = mpsc::channel::<(i32, i32)>();
+        let thread_handle = std::thread::spawn(move || {
+            log::debug!("TemporaryMouseMoveHandle thread started");
+            for (x, y) in rx {
+                ENIGO.lock().unwrap().mouse_move_to(x, y);
+            }
+            log::debug!("TemporaryMouseMoveHandle thread exiting");
+        });
+        TemporaryMouseMoveHandle {
+            thread_handle: Some(thread_handle),
+            tx: Some(tx),
+        }
+    }
+
+    pub fn move_mouse_to(&self, x: i32, y: i32) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send((x, y));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TemporaryMouseMoveHandle {
+    fn drop(&mut self) {
+        log::debug!("Dropping TemporaryMouseMoveHandle");
+        // Close the channel to signal the thread to exit.
+        self.tx.take();
+        // Wait for the thread to finish.
+        if let Some(thread_handle) = self.thread_handle.take() {
+            if let Err(e) = thread_handle.join() {
+                log::error!("Error joining TemporaryMouseMoveHandle thread: {:?}", e);
+            }
+        }
+    }
 }
 
 lazy_static::lazy_static! {
